@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..",
 from Backend.src.core.config import settings
 from Backend.src.db.base import Base
 # Import models so they are registered on Base.metadata
-from Backend.src.models.user import User, UserSession
+from Backend.src.models.user import User, UserSession, AccessRequest
 
 target_metadata = Base.metadata
 config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)

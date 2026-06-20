@@ -5,6 +5,7 @@ class UserCreate(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
     email: EmailStr
     password: str = Field(..., min_length=6, max_length=100)
+    role: str = "user"
 
 class UserLogin(BaseModel):
     username: str = Field(..., min_length=3, max_length=50)
@@ -14,6 +15,7 @@ class UserOut(BaseModel):
     id: str
     username: str
     email: str
+    role: str
     created_at: datetime
 
     class Config:
@@ -30,4 +32,17 @@ class SessionResponse(BaseModel):
 class GoogleLoginRequest(BaseModel):
     code: str
     redirect_uri: str
+
+
+class AccessRequestOut(BaseModel):
+    id: str
+    user_id: str
+    status: str
+    created_at: datetime
+    username: str | None = None
+    email: str | None = None
+
+    class Config:
+        from_attributes = True
+
 

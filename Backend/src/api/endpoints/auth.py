@@ -6,8 +6,8 @@ import uuid
 
 from Backend.src.db.session import get_db
 import httpx
-from Backend.src.models.user import User, UserSession
-from Backend.src.schemas.user import UserCreate, UserLogin, UserOut, SessionResponse, GoogleLoginRequest
+from Backend.src.models.user import User, UserSession, AccessRequest
+from Backend.src.schemas.user import UserCreate, UserLogin, UserOut, SessionResponse, GoogleLoginRequest, AccessRequestOut
 from Backend.src.core.security import hash_password, verify_password
 from Backend.src.core.config import settings
 
@@ -67,7 +67,8 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     new_user = User(
         username=user_in.username,
         email=user_in.email,
-        hashed_password=hash_password(user_in.password)
+        hashed_password=hash_password(user_in.password),
+        role=user_in.role
     )
     db.add(new_user)
     db.commit()
@@ -270,3 +271,126 @@ async def google_login(login_in: GoogleLoginRequest, db: Session = Depends(get_d
         "expires_at": session_record.expires_at,
         "user": user
     }
+
+
+class RoleChecker:
+    def __init__(self, allowed_roles: list[str]):
+        self.allowed_roles = allowed_roles
+
+    def __call__(self, current_user: User = Depends(get_current_user)) -> User:
+        if current_user.role not in self.allowed_roles:
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Operation not permitted for this user role."
+            )
+        return current_user
+
+
+# Test endpoints to verify RBAC
+@router.get("/admin-only", response_model=UserOut)
+def admin_only(current_user: User = Depends(RoleChecker(["admin"]))):
+    """Admin-only test endpoint."""
+    return current_user
+
+
+@router.get("/user-only", response_model=UserOut)
+def user_only(current_user: User = Depends(RoleChecker(["user", "admin"]))):
+    """User-only (or admin) test endpoint."""
+    return current_user
+
+
+@router.post("/access-request", response_model=AccessRequestOut, status_code=status.HTTP_201_CREATED)
+def request_admin_access(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Submit an elevation request to become an admin."""
+    if current_user.role == "admin":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User is already an administrator."
+        )
+        
+    stmt = select(AccessRequest).where(
+        AccessRequest.user_id == current_user.id,
+        AccessRequest.status == "pending"
+    )
+    existing_request = db.execute(stmt).scalar_one_or_none()
+    if existing_request:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="A pending request already exists for this user."
+        )
+        
+    new_request = AccessRequest(
+        user_id=current_user.id,
+        status="pending"
+    )
+    db.add(new_request)
+    db.commit()
+    db.refresh(new_request)
+    
+    new_request.username = current_user.username
+    new_request.email = current_user.email
+    return new_request
+
+
+@router.get("/access-request/status")
+def get_access_request_status(current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    """Get the status of the current user's elevation requests."""
+    stmt = select(AccessRequest).where(
+        AccessRequest.user_id == current_user.id
+    ).order_by(AccessRequest.created_at.desc())
+    request_record = db.execute(stmt).scalars().first()
+    
+    if not request_record:
+        return {"status": "none"}
+    return {"status": request_record.status}
+
+
+@router.get("/admin/access-requests", response_model=list[AccessRequestOut])
+def list_pending_requests(
+    current_user: User = Depends(RoleChecker(["admin"])),
+    db: Session = Depends(get_db)
+):
+    """List all pending access elevation requests (Admin only)."""
+    stmt = select(AccessRequest).where(AccessRequest.status == "pending").order_by(AccessRequest.created_at.asc())
+    requests = db.execute(stmt).scalars().all()
+    
+    for req in requests:
+        req.username = req.user.username
+        req.email = req.user.email
+    return requests
+
+
+@router.post("/admin/access-requests/{request_id}/approve")
+def approve_access_request(
+    request_id: str,
+    current_user: User = Depends(RoleChecker(["admin"])),
+    db: Session = Depends(get_db)
+):
+    """Approve access request and elevate the user to admin role."""
+    stmt = select(AccessRequest).where(AccessRequest.id == request_id)
+    req = db.execute(stmt).scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found.")
+        
+    req.status = "approved"
+    req.user.role = "admin"
+    db.commit()
+    return {"detail": f"Request approved. User {req.user.username} elevated to admin."}
+
+
+@router.post("/admin/access-requests/{request_id}/decline")
+def decline_access_request(
+    request_id: str,
+    current_user: User = Depends(RoleChecker(["admin"])),
+    db: Session = Depends(get_db)
+):
+    """Decline access request."""
+    stmt = select(AccessRequest).where(AccessRequest.id == request_id)
+    req = db.execute(stmt).scalar_one_or_none()
+    if not req:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Request not found.")
+        
+    req.status = "declined"
+    db.commit()
+    return {"detail": f"Request declined for user {req.user.username}."}
+
