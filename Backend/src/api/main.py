@@ -2,9 +2,21 @@ from fastapi import FastAPI, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import text
+import os
 from Backend.src.core.config import settings
-from Backend.src.api.endpoints import auth
+from Backend.src.api.endpoints import auth, document
 from Backend.src.db.session import get_db
+
+# Ensure uploads directory is created at startup
+os.makedirs(os.path.join("Backend", "uploads"), exist_ok=True)
+
+# Initialize pgvector database and chunks schema
+from Backend.src.db.session import init_vector_db
+try:
+    init_vector_db()
+except Exception as e:
+    import logging
+    logging.getLogger("uvicorn.error").error(f"Failed to initialize vector DB: {e}")
 
 app = FastAPI(title=settings.PROJECT_NAME)
 
@@ -19,6 +31,7 @@ app.add_middleware(
 
 # Register routers
 app.include_router(auth.router)
+app.include_router(document.router)
 
 @app.get("/")
 def read_root():

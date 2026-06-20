@@ -26,6 +26,66 @@ interface AccessRequest {
   email: string;
 }
 
+interface SpreadsheetSheet {
+  name: string;
+  rows: string[][];
+}
+
+const parseSpreadsheetData = (text: string, filename: string): SpreadsheetSheet[] => {
+  const ext = filename.split(".").pop()?.toLowerCase();
+  const sheets: SpreadsheetSheet[] = [];
+
+  if (!text || text.trim() === "" || text.startsWith("[No data found") || text.startsWith("[Empty CSV") || text.startsWith("[Error extracting")) {
+    return [];
+  }
+
+  if (ext === "csv" || !text.includes("--- Sheet: ")) {
+    // Single sheet CSV or text without sheet labels
+    const rows = text.split("\n").map(line => line.split(" | ").map(cell => cell.trim()));
+    sheets.push({
+      name: "CSV Sheet",
+      rows: rows.filter(r => r.length > 0 && (r.length > 1 || r[0] !== ""))
+    });
+  } else {
+    // Multi-sheet Excel
+    const sections = text.split(/--- Sheet: (.*?) ---\n/);
+    // sections will be: ["", "Sheet1", "row1|row2", "Sheet2", "row1|row2"]
+    for (let i = 1; i < sections.length; i += 2) {
+      const name = sections[i];
+      const content = sections[i + 1] || "";
+      const rows = content.split("\n").map(line => line.split(" | ").map(cell => cell.trim()));
+      sheets.push({
+        name: name,
+        rows: rows.filter(r => r.length > 0 && (r.length > 1 || r[0] !== ""))
+      });
+    }
+  }
+  return sheets;
+};
+
+interface SlideshowSlide {
+  index: number;
+  content: string[];
+}
+
+const parseSlideshowData = (text: string): SlideshowSlide[] => {
+  if (!text || text.trim() === "" || text.startsWith("[No text") || text.startsWith("[Error extracting")) {
+    return [];
+  }
+  const slides: SlideshowSlide[] = [];
+  const sections = text.split(/--- Slide (\d+) ---\n/);
+  // sections will be: ["", "1", "content1", "2", "content2"]
+  for (let i = 1; i < sections.length; i += 2) {
+    const num = parseInt(sections[i], 10);
+    const content = sections[i + 1] || "";
+    slides.push({
+      index: num,
+      content: content.split("\n").map(l => l.trim()).filter(l => l !== "")
+    });
+  }
+  return slides;
+};
+
 export default function Home() {
   const [activeTab, setActiveTab] = useState<"login" | "signup">("login");
   const [username, setUsername] = useState("");
@@ -48,6 +108,7 @@ export default function Home() {
   const [chatInput, setChatInput] = useState("");
   const [isTyping, setIsTyping] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement | null>(null);
+  const docxContainerRef = useRef<HTMLDivElement | null>(null);
 
   // Simulated Chat Logs per user role
   const [chatMessages, setChatMessages] = useState<Message[]>([]);
@@ -60,6 +121,33 @@ export default function Home() {
 
   // Notifications dropdown state
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+
+  // Knowledge Base State
+  interface KnowledgeDocument {
+    id: string;
+    filename: string;
+    content_type: string;
+    file_size: number;
+    status: string;
+    created_at: string;
+    created_by: string | null;
+    extracted_text?: string | null;
+  }
+  const [documents, setDocuments] = useState<KnowledgeDocument[]>([]);
+  const [loadingDocs, setLoadingDocs] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [previewDoc, setPreviewDoc] = useState<KnowledgeDocument | null>(null);
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [previewBlobUrl, setPreviewBlobUrl] = useState<string | null>(null);
+  const [activeSheetIndex, setActiveSheetIndex] = useState(0);
+  const [activeSlideIndex, setActiveSlideIndex] = useState(0);
+  const [sheetSearch, setSheetSearch] = useState("");
+  const [copySuccess, setCopySuccess] = useState(false);
+
+  const filteredDocuments = documents.filter((doc) => 
+    doc.filename.toLowerCase().includes(searchQuery.toLowerCase())
+  );
 
   const API_BASE = "http://localhost:8000/api/auth";
   const GOOGLE_CLIENT_ID = "327586945551-flc885mv8l2fohbc75qksliq0d0k1q4c.apps.googleusercontent.com";
@@ -97,7 +185,7 @@ export default function Home() {
             time: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
           }
         ]);
-        setDashboardTab("Knowledge Base");
+        setDashboardTab("Home");
       } else {
         setChatMessages([
           {
@@ -176,6 +264,214 @@ export default function Home() {
       }
     } catch (err) {
       console.error("Failed to fetch request status:", err);
+    }
+  };
+
+  const fetchDocuments = async (showLoadingSpinner = true) => {
+    if (!token) return;
+    if (showLoadingSpinner) setLoadingDocs(true);
+    try {
+      const res = await fetch("http://localhost:8000/api/documents", {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (res.ok) {
+        const data = await res.json();
+        setDocuments(data);
+      }
+    } catch (err) {
+      console.error("Failed to fetch documents:", err);
+    } finally {
+      if (showLoadingSpinner) setLoadingDocs(false);
+    }
+  };
+
+  useEffect(() => {
+    if (token && dashboardTab === "Knowledge Base") {
+      fetchDocuments();
+    }
+  }, [token, dashboardTab]);
+
+  // Background polling while documents are in Pending or Processing state
+  useEffect(() => {
+    const hasPendingDocs = documents.some(
+      (doc) => doc.status === "Pending" || doc.status === "Processing"
+    );
+
+    if (!hasPendingDocs || !token || dashboardTab !== "Knowledge Base") {
+      return;
+    }
+
+    const interval = setInterval(() => {
+      fetchDocuments(false); // poll in the background without showing spinner
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [documents, token, dashboardTab]);
+
+  const handleUploadClick = () => {
+    document.getElementById("file-upload-input")?.click();
+  };
+
+  const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    const formData = new FormData();
+    for (let i = 0; i < files.length; i++) {
+      formData.append("files", files[i]);
+    }
+
+    setUploading(true);
+    try {
+      const res = await fetch("http://localhost:8000/api/documents/upload", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+        body: formData,
+      });
+
+      if (res.ok) {
+        const newDocs = await res.json();
+        fetchDocuments();
+        alert(`Successfully uploaded ${newDocs.length} document(s).`);
+      } else {
+        const data = await res.json();
+        alert(`Upload failed: ${data.detail || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Upload error:", err);
+      alert("An error occurred during file upload.");
+    } finally {
+      setUploading(false);
+      e.target.value = "";
+    }
+  };
+
+  const handleDeleteDocument = async (docId: string, filename: string) => {
+    const confirmed = window.confirm(`Are you sure you want to permanently delete the document "${filename}"?`);
+    if (!confirmed) return;
+
+    try {
+      const res = await fetch(`http://localhost:8000/api/documents/${docId}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+
+      if (res.ok) {
+        setDocuments((prev) => prev.filter((d) => d.id !== docId));
+        alert(`Successfully deleted "${filename}".`);
+      } else {
+        const data = await res.json();
+        alert(`Delete failed: ${data.detail || "Unknown error"}`);
+      }
+    } catch (err) {
+      console.error("Delete error:", err);
+      alert("An error occurred during deletion.");
+    }
+  };
+
+  const handleClosePreview = () => {
+    setPreviewOpen(false);
+    setPreviewDoc(null);
+    setActiveSheetIndex(0);
+    setActiveSlideIndex(0);
+    setSheetSearch("");
+    if (previewBlobUrl) {
+      URL.revokeObjectURL(previewBlobUrl);
+      setPreviewBlobUrl(null);
+    }
+  };
+
+  const handleCopyToClipboard = (text: string) => {
+    navigator.clipboard.writeText(text);
+    setCopySuccess(true);
+    setTimeout(() => setCopySuccess(false), 2000);
+  };
+
+  useEffect(() => {
+    if (previewDoc && previewBlobUrl && docxContainerRef.current) {
+      const fileExt = previewDoc.filename.split(".").pop()?.toLowerCase() || "";
+      if (fileExt === "docx") {
+        const renderDocx = async () => {
+          try {
+            if (docxContainerRef.current) {
+              docxContainerRef.current.innerHTML = "<div class='p-4 text-center text-xs text-[#0f172a]/50 uppercase tracking-widest animate-pulse'>Rendering Word Document...</div>";
+            }
+            
+            const blobRes = await fetch(previewBlobUrl);
+            const blob = await blobRes.blob();
+            
+            const docx = await import("docx-preview");
+            if (docxContainerRef.current) {
+              docxContainerRef.current.innerHTML = "";
+              await docx.renderAsync(blob, docxContainerRef.current, undefined, {
+                inWrapper: false,
+                ignoreWidth: false,
+                ignoreHeight: false,
+                experimental: true
+              });
+            }
+          } catch (err) {
+            console.error("Failed to render docx:", err);
+            if (docxContainerRef.current) {
+              docxContainerRef.current.innerHTML = `<div class="p-4 text-red-500 text-xs">[Failed to render document: ${err}]</div>`;
+            }
+          }
+        };
+        renderDocx();
+      }
+    }
+  }, [previewDoc, previewBlobUrl]);
+
+  const handlePreviewDocument = async (doc: KnowledgeDocument) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`http://localhost:8000/api/documents/${doc.id}`, {
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      if (res.ok) {
+        const detailedDoc = await res.json();
+        setPreviewDoc(detailedDoc);
+        
+        // Reset sub-tab indexing and search states
+        setActiveSheetIndex(0);
+        setActiveSlideIndex(0);
+        setSheetSearch("");
+        
+        // Fetch binary blob if it is a visual format (PDF, DOCX, or image)
+        const ext = doc.filename.split(".").pop()?.toLowerCase();
+        if (["pdf", "docx", "png", "jpg", "jpeg", "gif", "webp", "svg"].includes(ext || "")) {
+          try {
+            const serveRes = await fetch(`http://localhost:8000/api/documents/serve/${doc.id}`, {
+              headers: {
+                Authorization: `Bearer ${token}`,
+              },
+            });
+            if (serveRes.ok) {
+              const blob = await serveRes.blob();
+              const url = URL.createObjectURL(blob);
+              setPreviewBlobUrl(url);
+            } else {
+              console.error("Failed to fetch document file blob");
+            }
+          } catch (blobErr) {
+            console.error("Error fetching file blob:", blobErr);
+          }
+        }
+        
+        setPreviewOpen(true);
+      } else {
+        alert("Failed to retrieve document details.");
+      }
+    } catch (err) {
+      console.error("Failed to fetch doc details:", err);
     }
   };
 
@@ -441,23 +737,21 @@ export default function Home() {
                   Navigation
                 </span>
                 <ul className="space-y-1">
-                  {user.role !== "admin" && (
-                    <li>
-                      <button
-                        onClick={() => setDashboardTab("Home")}
-                        className={`w-full flex items-center gap-3 px-3 py-2 rounded-[4px] text-xs transition-all ${
-                          dashboardTab === "Home"
-                            ? "bg-[#eef1f4] text-[#0f172a] font-bold"
-                            : "text-[#0f172a]/60 hover:text-[#0f172a] hover:bg-[#eef1f4]/50"
-                        }`}
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
-                        </svg>
-                        Home
-                      </button>
-                    </li>
-                  )}
+                  <li>
+                    <button
+                      onClick={() => setDashboardTab("Home")}
+                      className={`w-full flex items-center gap-3 px-3 py-2 rounded-[4px] text-xs transition-all ${
+                        dashboardTab === "Home"
+                          ? "bg-[#eef1f4] text-[#0f172a] font-bold"
+                          : "text-[#0f172a]/60 hover:text-[#0f172a] hover:bg-[#eef1f4]/50"
+                      }`}
+                    >
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 12l2-2m0 0l7-7 7 7M5 10v10a1 1 0 001 1h3m10-11l2 2m-2-2v10a1 1 0 01-1 1h-3m-6 0a1 1 0 001-1v-4a1 1 0 011-1h2a1 1 0 011 1v4a1 1 0 001 1m-6 0h6"/>
+                      </svg>
+                      Home
+                    </button>
+                  </li>
                   <li>
                     <button
                       onClick={() => setDashboardTab("Knowledge Base")}
@@ -563,7 +857,9 @@ export default function Home() {
                 </span>
                 <input
                   type="text"
-                  placeholder={user.role === "admin" ? "Search conversations or logs..." : "Search your workspace..."}
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder={dashboardTab === "Knowledge Base" ? "Search documents by name..." : (user.role === "admin" ? "Search conversations or logs..." : "Search your workspace...")}
                   className="w-full rounded-[4px] bg-[#f7f9fb] border border-transparent pl-9 pr-4 py-1.5 text-xs text-[#0f172a] placeholder-[#0f172a]/40 focus:bg-white focus:border-[#0f172a]/20 outline-none transition-all"
                 />
               </div>
@@ -703,186 +999,384 @@ export default function Home() {
 
             {/* Central Main Area */}
             <div className="flex-1 overflow-y-auto flex flex-col justify-between">
-              
-              {/* Messages & Layout */}
-              <div className="p-6 md:p-8 space-y-8 flex-1">
-                {/* Dashboard Welcome Header */}
-                <div>
-                  <h2 className="text-xl font-bold tracking-tight text-[#0f172a]">
-                    {user.role === "admin" 
-                      ? "Good morning, Director" 
-                      : `Good evening, ${user.username}`}
-                  </h2>
-                  <p className="text-xs text-[#0f172a]/50 mt-1">
-                    {user.role === "admin" 
-                      ? "Active systems and operations dashboard. Review clearances and tune agent metrics below." 
-                      : "Welcome to your digital operations center. Select a curated briefing or initiate queries below."}
-                  </p>
-                </div>
-
-                {/* Quick Action Cards Grid */}
-                {chatMessages.length <= 1 && (
-                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-6">
-                    {user.role === "admin" ? (
-                      /* Admin Quick Actions */
-                      <>
+              {dashboardTab === "Knowledge Base" ? (
+                /* Knowledge Base Workspace */
+                <div className="p-6 md:p-8 space-y-6 flex-1">
+                  <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4 border-b border-[#eef1f4] pb-5">
+                    <div>
+                      <h2 className="text-xl font-bold tracking-tight text-[#0f172a]">Knowledge Base Workspace</h2>
+                      <p className="text-xs text-[#0f172a]/50 mt-1">
+                        Access, upload, and search verified guidelines and reference documentation.
+                      </p>
+                    </div>
+                    {user.role === "admin" && (
+                      <div>
                         <button
-                          onClick={() => handleQuickAction("Generate comprehensive Knowledge Base sync log")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                          onClick={handleUploadClick}
+                          disabled={uploading}
+                          className="flex items-center justify-center gap-2 rounded-[4px] bg-[#0f172a] hover:bg-[#1e293b] px-4 py-2.5 text-xs font-bold text-white transition-all shadow-sm cursor-pointer disabled:opacity-50"
                         >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            📚 Knowledge Base
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Synchronize corporate insurance files & indexes.</span>
+                          {uploading ? (
+                            <>
+                              <div className="h-3.5 w-3.5 animate-spin rounded-full border-2 border-white border-t-transparent"></div>
+                              Uploading...
+                            </>
+                          ) : (
+                            <>
+                              <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
+                              </svg>
+                              Upload Document
+                            </>
+                          )}
                         </button>
-                        <button
-                          onClick={() => handleQuickAction("Audit active Admin Operations")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            🛡️ Admin Operations
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Check access metrics and service uptime logs.</span>
-                        </button>
-                        <button
-                          onClick={() => handleQuickAction("View employee roles and recent clearance level changes")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            👥 Employee Management
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Audit clearance requests and active personnel roles.</span>
-                        </button>
-                        <button
-                          onClick={() => handleQuickAction("Display model performance and Agent Tuning logs")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            ⚙️ Agent Tuning
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Optimize LLM weights and evaluate system latency.</span>
-                        </button>
-                      </>
-                    ) : (
-                      /* User Quick Actions */
-                      <>
-                        <button
-                          onClick={() => handleQuickAction("Fetch latest Market Report")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            📈 Market Report
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Analyze sector growth trends and underwriting stats.</span>
-                        </button>
-                        <button
-                          onClick={() => handleQuickAction("Draft Briefing Note for policy updates")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            📝 Briefing Note
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Synthesize current policy updates and agent actions.</span>
-                        </button>
-                        <button
-                          onClick={() => handleQuickAction("Generate Strategy Sync documentation")}
-                          className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
-                        >
-                          <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
-                            🤝 Strategy Sync
-                            <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
-                          </span>
-                          <span className="text-[10px] text-[#0f172a]/50">Harmonize claim assessments with executive goals.</span>
-                        </button>
-                      </>
+                        <input
+                          id="file-upload-input"
+                          type="file"
+                          multiple
+                          className="hidden"
+                          onChange={handleFileUpload}
+                        />
+                      </div>
                     )}
                   </div>
-                )}
 
-                {/* Chat Message Thread */}
-                <div className="space-y-4 min-h-[250px] flex flex-col justify-end">
-                  {chatMessages.map((msg) => (
-                    <div
-                      key={msg.id}
-                      className={`flex flex-col max-w-[85%] ${
-                        msg.sender === "user" ? "ml-auto items-end" : "mr-auto items-start"
-                      }`}
-                    >
-                      <div className="text-[10px] text-[#0f172a]/40 font-bold mb-1 uppercase tracking-wider">
-                        {msg.sender === "user" ? "You" : "System Agent"} • {msg.time}
+                  {/* Summary Metric Cards */}
+                  <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                    <div className="p-4 bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] flex items-center justify-between shadow-sm">
+                      <div>
+                        <span className="text-[10px] font-bold text-[#0f172a]/40 uppercase tracking-wider">Total Assets</span>
+                        <h3 className="text-sm font-extrabold text-[#0f172a] mt-1">
+                          {documents.length} {documents.length === 1 ? "Document" : "Documents"}
+                        </h3>
                       </div>
-                      <div
-                        className={`px-4 py-3 rounded-[4px] text-xs leading-relaxed border ${
-                          msg.sender === "user"
-                            ? "bg-[#0f172a] text-white border-transparent shadow-sm"
-                            : "bg-[#f7f9fb] text-[#0f172a] border-[#eef1f4]"
-                        }`}
+                      <div className="h-9 w-9 rounded-full bg-[#0f172a]/5 flex items-center justify-center text-sm">
+                        📚
+                      </div>
+                    </div>
+                    
+                    <div className="p-4 bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] flex items-center justify-between shadow-sm">
+                      <div>
+                        <span className="text-[10px] font-bold text-[#0f172a]/40 uppercase tracking-wider">Clearance Access</span>
+                        <h3 className="text-sm font-extrabold text-[#0f172a] mt-1">
+                          {user.role === "admin" ? "Level 5 (Admin)" : "Level 1 (Read-Only)"}
+                        </h3>
+                      </div>
+                      <div className="h-9 w-9 rounded-full bg-[#0f172a]/5 flex items-center justify-center text-sm">
+                        🛡️
+                      </div>
+                    </div>
+
+                    <div className="p-4 bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] flex items-center justify-between shadow-sm">
+                      <div>
+                        <span className="text-[10px] font-bold text-[#0f172a]/40 uppercase tracking-wider">Indexing Engine</span>
+                        <h3 className="text-sm font-extrabold text-emerald-600 mt-1 flex items-center gap-1.5">
+                          <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                          Operational
+                        </h3>
+                      </div>
+                      <div className="h-9 w-9 rounded-full bg-[#0f172a]/5 flex items-center justify-center text-sm">
+                        ⚡
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* Directory Table Card */}
+                  <div className="bg-white border border-[#eef1f4] rounded-[4px] overflow-hidden shadow-sm">
+                    <div className="px-4 py-3 border-b border-[#eef1f4] flex justify-between items-center bg-[#f7f9fb]/50">
+                      <span className="text-[10px] font-bold text-[#0f172a]/50 uppercase tracking-widest">
+                        Document Directory
+                      </span>
+                      {searchQuery && (
+                        <span className="text-[9px] bg-[#0f172a]/5 text-[#0f172a]/60 px-2 py-0.5 rounded-[4px] font-semibold">
+                          Found {filteredDocuments.length} of {documents.length}
+                        </span>
+                      )}
+                    </div>
+
+                    {loadingDocs ? (
+                      <div className="p-12 flex flex-col items-center justify-center gap-2">
+                        <div className="h-6 w-6 animate-spin rounded-full border-2 border-[#0f172a] border-t-transparent"></div>
+                        <span className="text-xs text-[#0f172a]/50">Retrieving index files...</span>
+                      </div>
+                    ) : filteredDocuments.length > 0 ? (
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse">
+                          <thead>
+                            <tr className="border-b border-[#eef1f4] bg-[#f7f9fb]/20 text-[9px] font-bold text-[#0f172a]/40 uppercase tracking-wider">
+                              <th className="px-4 py-3">Name</th>
+                              <th className="px-4 py-3">Status</th>
+                              <th className="px-4 py-3">Upload Date</th>
+                              <th className="px-4 py-3">File Size</th>
+                              <th className="px-4 py-3 text-right">Actions</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-[#eef1f4] text-xs">
+                            {filteredDocuments.map((doc) => {
+                              const ext = doc.filename.split('.').pop()?.toLowerCase();
+                              let icon = "📄";
+                              let iconColor = "text-slate-500";
+                              if (ext === "pdf") { icon = "📕"; iconColor = "text-rose-500"; }
+                              else if (["doc", "docx"].includes(ext || "")) { icon = "📘"; iconColor = "text-blue-500"; }
+                              else if (["txt", "md"].includes(ext || "")) { icon = "📝"; iconColor = "text-emerald-500"; }
+                              else if (ext === "json") { icon = "⚙️"; iconColor = "text-violet-500"; }
+
+                              return (
+                                <tr key={doc.id} className="hover:bg-[#f7f9fb]/40 transition-colors">
+                                  <td className="px-4 py-3 font-semibold text-[#0f172a] max-w-[200px] sm:max-w-xs truncate">
+                                    <span className={`inline-block mr-2 ${iconColor}`}>{icon}</span>
+                                    {doc.filename}
+                                  </td>
+                                  <td className="px-4 py-3">
+                                    {doc.status === "Ready" || doc.status === "Processed" ? (
+                                      <span className="inline-flex items-center gap-1 text-[9px] font-bold text-emerald-600 bg-emerald-50 border border-emerald-100 px-1.5 py-0.5 rounded-[4px]">
+                                        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500"></span>
+                                        {doc.status}
+                                      </span>
+                                    ) : doc.status === "Failed" ? (
+                                      <span className="inline-flex items-center gap-1 text-[9px] font-bold text-rose-600 bg-rose-50 border border-rose-100 px-1.5 py-0.5 rounded-[4px]">
+                                        <span className="h-1.5 w-1.5 rounded-full bg-rose-500"></span>
+                                        {doc.status}
+                                      </span>
+                                    ) : (
+                                      <span className="inline-flex items-center gap-1 text-[9px] font-bold text-amber-600 bg-amber-50 border border-amber-100 px-1.5 py-0.5 rounded-[4px]">
+                                        <span className="h-1.5 w-1.5 rounded-full bg-amber-500 animate-pulse"></span>
+                                        {doc.status}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="px-4 py-3 text-[#0f172a]/60">
+                                    {new Date(doc.created_at).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' })}
+                                  </td>
+                                  <td className="px-4 py-3 text-[#0f172a]/60 font-mono text-[10px]">
+                                    {(doc.file_size / 1024).toFixed(1)} KB
+                                  </td>
+                                  <td className="px-4 py-3 text-right">
+                                    <div className="flex justify-end gap-1.5">
+                                      <button
+                                        onClick={() => handlePreviewDocument(doc)}
+                                        title="Preview content"
+                                        className="p-1 rounded-[4px] border border-slate-200 text-slate-500 hover:bg-[#eef1f4] hover:text-[#0f172a] transition-all cursor-pointer"
+                                      >
+                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z"/>
+                                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M2.458 12C3.732 7.943 7.523 5 12 5c4.478 0 8.268 2.943 9.542 7-1.274 4.057-5.064 7-9.542 7-4.477 0-8.268-2.943-9.542-7z"/>
+                                        </svg>
+                                      </button>
+                                      {user.role === "admin" && (
+                                        <button
+                                          onClick={() => handleDeleteDocument(doc.id, doc.filename)}
+                                          title="Delete document"
+                                          className="p-1 rounded-[4px] border border-rose-100 text-rose-600 hover:bg-rose-50 transition-all cursor-pointer"
+                                        >
+                                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"/>
+                                          </svg>
+                                        </button>
+                                      )}
+                                    </div>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    ) : (
+                      <div className="p-16 text-center">
+                        <span className="text-2xl block mb-2">📁</span>
+                        <h4 className="text-xs font-bold text-[#0f172a]">No documents found</h4>
+                        <p className="text-[10px] text-[#0f172a]/40 max-w-xs mx-auto mt-1 leading-relaxed">
+                          {searchQuery ? "No records match your active search criteria." : "Upload guideline or reference files to populate the workspace directory."}
+                        </p>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ) : (
+                /* Chat interface (existing) */
+                <>
+                  {/* Messages & Layout */}
+                  <div className="p-6 md:p-8 space-y-8 flex-1">
+                    {/* Dashboard Welcome Header */}
+                    <div>
+                      <h2 className="text-xl font-bold tracking-tight text-[#0f172a]">
+                        {user.role === "admin" 
+                          ? "Good morning, Director" 
+                          : `Good evening, ${user.username}`}
+                      </h2>
+                      <p className="text-xs text-[#0f172a]/50 mt-1">
+                        {user.role === "admin" 
+                          ? "Active systems and operations dashboard. Review clearances and tune agent metrics below." 
+                          : "Welcome to your digital operations center. Select a curated briefing or initiate queries below."}
+                      </p>
+                    </div>
+
+                    {/* Quick Action Cards Grid */}
+                    {chatMessages.length <= 1 && (
+                      <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4 mt-6">
+                        {user.role === "admin" ? (
+                          /* Admin Quick Actions */
+                          <>
+                            <button
+                              onClick={() => handleQuickAction("Generate comprehensive Knowledge Base sync log")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                📚 Knowledge Base
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Synchronize corporate insurance files & indexes.</span>
+                            </button>
+                            <button
+                              onClick={() => handleQuickAction("Audit active Admin Operations")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                🛡️ Admin Operations
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Check access metrics and service uptime logs.</span>
+                            </button>
+                            <button
+                              onClick={() => handleQuickAction("View employee roles and recent clearance level changes")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                👥 Employee Management
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Audit clearance requests and active personnel roles.</span>
+                            </button>
+                            <button
+                              onClick={() => handleQuickAction("Display model performance and Agent Tuning logs")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                ⚙️ Agent Tuning
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Optimize LLM weights and evaluate system latency.</span>
+                            </button>
+                          </>
+                        ) : (
+                          /* User Quick Actions */
+                          <>
+                            <button
+                              onClick={() => handleQuickAction("Fetch latest Market Report")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                📈 Market Report
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Analyze sector growth trends and underwriting stats.</span>
+                            </button>
+                            <button
+                              onClick={() => handleQuickAction("Draft Briefing Note for policy updates")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                📝 Briefing Note
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Synthesize current policy updates and agent actions.</span>
+                            </button>
+                            <button
+                              onClick={() => handleQuickAction("Generate Strategy Sync documentation")}
+                              className="flex flex-col text-left p-4 bg-[#f7f9fb] hover:bg-[#eef1f4] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer group"
+                            >
+                              <span className="text-xs font-bold text-[#0f172a] mb-1 flex items-center gap-1.5">
+                                🤝 Strategy Sync
+                                <svg className="w-3 h-3 text-[#0f172a]/30 group-hover:translate-x-0.5 transition-transform" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M9 5l7 7-7 7"/></svg>
+                              </span>
+                              <span className="text-[10px] text-[#0f172a]/50">Harmonize claim assessments with executive goals.</span>
+                            </button>
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {/* Chat Message Thread */}
+                    <div className="space-y-4 min-h-[250px] flex flex-col justify-end">
+                      {chatMessages.map((msg) => (
+                        <div
+                          key={msg.id}
+                          className={`flex flex-col max-w-[85%] ${
+                            msg.sender === "user" ? "ml-auto items-end" : "mr-auto items-start"
+                          }`}
+                        >
+                          <div className="text-[10px] text-[#0f172a]/40 font-bold mb-1 uppercase tracking-wider">
+                            {msg.sender === "user" ? "You" : "System Agent"} • {msg.time}
+                          </div>
+                          <div
+                            className={`px-4 py-3 rounded-[4px] text-xs leading-relaxed border ${
+                              msg.sender === "user"
+                                ? "bg-[#0f172a] text-white border-transparent shadow-sm"
+                                : "bg-[#f7f9fb] text-[#0f172a] border-[#eef1f4]"
+                            }`}
+                          >
+                            {msg.text}
+                          </div>
+                        </div>
+                      ))}
+
+                      {/* Thinking Loader */}
+                      {isTyping && (
+                        <div className="flex flex-col items-start max-w-[85%] mr-auto">
+                          <div className="text-[10px] text-[#0f172a]/40 font-bold mb-1 uppercase tracking-wider">
+                            System Agent is processing...
+                          </div>
+                          <div className="flex items-center gap-1 bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] px-4 py-3">
+                            <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
+                            <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
+                            <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
+                          </div>
+                        </div>
+                      )}
+
+                      <div ref={messagesEndRef} />
+                    </div>
+                  </div>
+
+                  {/* Chat Input (Sticky Footer) */}
+                  <div className="p-6 border-t border-[#eef1f4] bg-white sticky bottom-0">
+                    <div className="max-w-4xl mx-auto flex items-center gap-3">
+                      {/* Attachment Icon */}
+                      <button 
+                        onClick={() => alert("File attachment upload simulated")}
+                        className="p-2.5 text-[#0f172a]/50 hover:text-[#0f172a] hover:bg-[#f7f9fb] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer"
+                        title="Attach File"
                       >
-                        {msg.text}
-                      </div>
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"/>
+                        </svg>
+                      </button>
+
+                      {/* Input Element */}
+                      <input
+                        type="text"
+                        value={chatInput}
+                        onChange={(e) => setChatInput(e.target.value)}
+                        onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
+                        placeholder="Enter query or type instruction..."
+                        className="flex-1 rounded-[4px] border border-[#eef1f4] bg-white px-4 py-2.5 text-xs text-[#0f172a] placeholder-[#0f172a]/30 focus:border-[#0f172a]/30 outline-none transition-all shadow-sm"
+                      />
+
+                      {/* Send Button */}
+                      <button
+                        onClick={() => handleSendMessage()}
+                        disabled={!chatInput.trim()}
+                        className="p-2.5 rounded-[4px] bg-[#0f172a] text-white hover:bg-[#1e293b] disabled:opacity-30 disabled:pointer-events-none transition-all cursor-pointer shadow-sm"
+                      >
+                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
+                        </svg>
+                      </button>
                     </div>
-                  ))}
-
-                  {/* Thinking Loader */}
-                  {isTyping && (
-                    <div className="flex flex-col items-start max-w-[85%] mr-auto">
-                      <div className="text-[10px] text-[#0f172a]/40 font-bold mb-1 uppercase tracking-wider">
-                        System Agent is processing...
-                      </div>
-                      <div className="flex items-center gap-1 bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] px-4 py-3">
-                        <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "0ms" }}></span>
-                        <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "150ms" }}></span>
-                        <span className="h-1.5 w-1.5 bg-[#0f172a]/60 rounded-full animate-bounce" style={{ animationDelay: "300ms" }}></span>
-                      </div>
-                    </div>
-                  )}
-
-                  <div ref={messagesEndRef} />
-                </div>
-              </div>
-
-              {/* Chat Input (Sticky Footer) */}
-              <div className="p-6 border-t border-[#eef1f4] bg-white sticky bottom-0">
-                <div className="max-w-4xl mx-auto flex items-center gap-3">
-                  {/* Attachment Icon */}
-                  <button 
-                    onClick={() => alert("File attachment upload simulated")}
-                    className="p-2.5 text-[#0f172a]/50 hover:text-[#0f172a] hover:bg-[#f7f9fb] rounded-[4px] border border-[#eef1f4] transition-all cursor-pointer"
-                    title="Attach File"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M12 9v3m0 0v3m0-3h3m-3 0H9m12 0a9 9 0 11-18 0 9 9 0 0118 0z"/>
-                    </svg>
-                  </button>
-
-                  {/* Input Element */}
-                  <input
-                    type="text"
-                    value={chatInput}
-                    onChange={(e) => setChatInput(e.target.value)}
-                    onKeyDown={(e) => e.key === "Enter" && handleSendMessage()}
-                    placeholder="Enter query or type instruction..."
-                    className="flex-1 rounded-[4px] border border-[#eef1f4] bg-white px-4 py-2.5 text-xs text-[#0f172a] placeholder-[#0f172a]/30 focus:border-[#0f172a]/30 outline-none transition-all shadow-sm"
-                  />
-
-                  {/* Send Button */}
-                  <button
-                    onClick={() => handleSendMessage()}
-                    disabled={!chatInput.trim()}
-                    className="p-2.5 rounded-[4px] bg-[#0f172a] text-white hover:bg-[#1e293b] disabled:opacity-30 disabled:pointer-events-none transition-all cursor-pointer shadow-sm"
-                  >
-                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M14 5l7 7m0 0l-7 7m7-7H3"/>
-                    </svg>
-                  </button>
-                </div>
-              </div>
+                  </div>
+                </>
+              )}
             </div>
           </main>
 
@@ -1064,7 +1558,6 @@ export default function Home() {
                 )}
               </div>
 
-              {/* Collapsed Close Trigger */}
               <div className="p-4 border-t border-[#eef1f4] flex justify-end">
                 <button
                   onClick={() => setRightSidebarOpen(false)}
@@ -1074,6 +1567,391 @@ export default function Home() {
                 </button>
               </div>
             </aside>
+          )}
+
+          {/* Document Preview Modal */}
+          {previewOpen && previewDoc && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-sm p-4 animate-in fade-in duration-200">
+              <div className="w-full max-w-4xl bg-white border border-[#eef1f4] rounded-[4px] shadow-2xl flex flex-col max-h-[90vh] animate-in zoom-in-95 duration-200">
+                {/* Modal Header */}
+                <div className="px-6 py-4 border-b border-[#eef1f4] flex justify-between items-start">
+                  <div>
+                    <h3 className="text-sm font-bold text-[#0f172a] truncate max-w-lg">
+                      {previewDoc.filename}
+                    </h3>
+                    <div className="flex gap-4 mt-1 text-[10px] font-semibold text-[#0f172a]/40 uppercase tracking-wider font-mono">
+                      <span>Size: {(previewDoc.file_size / 1024).toFixed(1)} KB</span>
+                      <span>Type: {previewDoc.content_type}</span>
+                      <span>Uploaded: {new Date(previewDoc.created_at).toLocaleDateString()}</span>
+                    </div>
+                  </div>
+                  <button
+                    onClick={handleClosePreview}
+                    className="p-1 rounded-[4px] hover:bg-[#eef1f4] text-[#0f172a]/50 hover:text-[#0f172a] transition-all cursor-pointer"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2.5" d="M6 18L18 6M6 6l12 12"/>
+                    </svg>
+                  </button>
+                </div>
+
+                {/* Modal Content */}
+                <div className="flex-1 overflow-y-auto p-6 bg-[#f7f9fb] text-xs">
+                  {(() => {
+                    const fileExt = previewDoc.filename.split(".").pop()?.toLowerCase() || "";
+
+                    // Helper to get column letter (A, B, C...)
+                    const getColLetter = (index: number): string => {
+                      let letter = "";
+                      let temp = index;
+                      while (temp >= 0) {
+                        letter = String.fromCharCode((temp % 26) + 65) + letter;
+                        temp = Math.floor(temp / 26) - 1;
+                      }
+                      return letter;
+                    };
+
+                    // 1. PDF Preview
+                    if (fileExt === "pdf") {
+                      return (
+                        <div className="w-full flex flex-col gap-2">
+                          {previewBlobUrl ? (
+                            <iframe
+                              src={`${previewBlobUrl}#toolbar=0`}
+                              className="w-full h-[60vh] border border-[#eef1f4] rounded-[4px] shadow-inner bg-white"
+                              title={previewDoc.filename}
+                            />
+                          ) : (
+                            <div className="flex items-center justify-center h-[50vh] bg-white border border-[#eef1f4] rounded-[4px]">
+                              <div className="flex flex-col items-center gap-2">
+                                <div className="h-6 w-6 animate-spin rounded-full border-2 border-[#0f172a] border-t-transparent"></div>
+                                <span className="text-[10px] font-bold text-[#0f172a]/60 uppercase tracking-widest animate-pulse">Loading PDF Document...</span>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      );
+                    }
+
+                    // 2. Image Preview
+                    if (["png", "jpg", "jpeg", "gif", "webp", "svg"].includes(fileExt)) {
+                      return (
+                        <div className="w-full flex flex-col items-center gap-4 bg-white border border-[#eef1f4] rounded-[4px] p-6 shadow-sm">
+                          {previewBlobUrl ? (
+                            <div className="relative group max-w-full overflow-hidden flex justify-center items-center rounded bg-[#f7f9fb] p-4 border border-[#eef1f4]/60">
+                              {/* eslint-disable-next-line @next/next/no-img-element */}
+                              <img
+                                src={previewBlobUrl}
+                                alt={previewDoc.filename}
+                                className="max-h-[50vh] object-contain transition-transform duration-200"
+                                id="preview-image-element"
+                              />
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-center h-[50vh] w-full">
+                              <div className="flex flex-col items-center gap-2">
+                                <div className="h-6 w-6 animate-spin rounded-full border-2 border-[#0f172a] border-t-transparent"></div>
+                                <span className="text-[10px] font-bold text-[#0f172a]/60 uppercase tracking-widest animate-pulse">Loading Image...</span>
+                              </div>
+                            </div>
+                          )}
+                          <div className="flex items-center gap-3">
+                            <button
+                              onClick={() => {
+                                const img = document.getElementById("preview-image-element");
+                                if (img) img.style.transform = `scale(1)`;
+                              }}
+                              className="px-3 py-1 bg-[#f7f9fb] hover:bg-[#eef1f4] border border-[#eef1f4] rounded-[4px] text-[10px] font-bold text-[#0f172a]/60 uppercase tracking-widest cursor-pointer transition-colors"
+                            >
+                              Reset Zoom
+                            </button>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // 3. Spreadsheet Preview (XLSX, XLS, CSV)
+                    if (["xlsx", "xls", "csv"].includes(fileExt)) {
+                      const sheets = parseSpreadsheetData(previewDoc.extracted_text || "", previewDoc.filename);
+                      if (sheets.length === 0) {
+                        return (
+                          <div className="bg-white border border-[#eef1f4] rounded-[4px] p-6 text-center text-xs font-semibold text-[#0f172a]/50">
+                            [No readable grid data extracted from this spreadsheet]
+                          </div>
+                        );
+                      }
+                      const activeSheet = sheets[activeSheetIndex] || sheets[0];
+                      const maxCols = activeSheet.rows.reduce((max, r) => Math.max(max, r.length), 0);
+
+                      return (
+                        <div className="w-full flex flex-col gap-3">
+                          {/* Spreadsheet Toolbar */}
+                          <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-2 bg-white border border-[#eef1f4] p-3 rounded-[4px] shadow-sm select-none">
+                            {/* Tabs for sheets */}
+                            <div className="flex flex-wrap gap-1">
+                              {sheets.map((sheet, idx) => (
+                                <button
+                                  key={idx}
+                                  onClick={() => setActiveSheetIndex(idx)}
+                                  className={`px-3 py-1.5 rounded-[4px] text-[10px] font-bold uppercase tracking-wider transition-colors cursor-pointer border ${
+                                    activeSheetIndex === idx
+                                      ? "bg-[#0f172a] text-white border-[#0f172a]"
+                                      : "bg-white text-[#0f172a]/70 border-[#eef1f4] hover:bg-[#f7f9fb]"
+                                  }`}
+                                >
+                                  📊 {sheet.name}
+                                </button>
+                              ))}
+                            </div>
+                            {/* Cell search */}
+                            <div className="relative w-full sm:w-64">
+                              <input
+                                type="text"
+                                placeholder="Find in sheet..."
+                                value={sheetSearch}
+                                onChange={(e) => setSheetSearch(e.target.value)}
+                                className="w-full bg-[#f7f9fb] border border-[#eef1f4] rounded-[4px] px-3 py-1.5 text-[10px] font-semibold text-[#0f172a] placeholder-[#0f172a]/40 focus:bg-white outline-none focus:border-[#0f172a]/20"
+                              />
+                            </div>
+                          </div>
+
+                          {/* Grid container */}
+                          <div className="bg-white border border-[#eef1f4] rounded-[4px] shadow-sm overflow-auto max-h-[55vh] select-text">
+                            <table className="min-w-full border-collapse text-left font-mono text-[11px] leading-normal table-fixed">
+                              <thead className="bg-[#f7f9fb] sticky top-0 z-10 border-b border-[#eef1f4]">
+                                <tr>
+                                  <th className="w-12 border-r border-[#eef1f4] p-1.5 text-center text-[#0f172a]/40 bg-[#f7f9fb]"></th>
+                                  {Array.from({ length: maxCols }).map((_, i) => (
+                                    <th key={i} className="min-w-[120px] border-r border-[#eef1f4] p-1.5 text-center font-bold text-[#0f172a]/60 bg-[#f7f9fb] uppercase">
+                                      {getColLetter(i)}
+                                    </th>
+                                  ))}
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {activeSheet.rows.map((row, rIdx) => (
+                                  <tr key={rIdx} className="border-b border-[#eef1f4] hover:bg-[#f7f9fb]/40 transition-colors">
+                                    <td className="sticky left-0 border-r border-[#eef1f4] p-1.5 text-center font-bold text-[#0f172a]/40 bg-[#f7f9fb] select-none">
+                                      {rIdx + 1}
+                                    </td>
+                                    {Array.from({ length: maxCols }).map((_, cIdx) => {
+                                      const cellValue = row[cIdx] !== undefined ? String(row[cIdx]) : "";
+                                      const hasMatch = sheetSearch && cellValue.toLowerCase().includes(sheetSearch.toLowerCase());
+                                      return (
+                                        <td
+                                          key={cIdx}
+                                          className={`border-r border-[#eef1f4] p-1.5 truncate max-w-[200px] select-text ${
+                                            hasMatch
+                                              ? "bg-amber-100 text-amber-950 font-bold border-amber-300"
+                                              : "text-[#0f172a]/80"
+                                          }`}
+                                          title={cellValue}
+                                        >
+                                          {cellValue}
+                                        </td>
+                                      );
+                                    })}
+                                  </tr>
+                                ))}
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // 4. Slide Preview (PPTX, PPT)
+                    if (["pptx", "ppt"].includes(fileExt)) {
+                      const slides = parseSlideshowData(previewDoc.extracted_text || "");
+                      if (slides.length === 0) {
+                        return (
+                          <div className="bg-white border border-[#eef1f4] rounded-[4px] p-6 text-center text-xs font-semibold text-[#0f172a]/50">
+                            [No readable slide content extracted from this presentation]
+                          </div>
+                        );
+                      }
+                      const activeSlide = slides[activeSlideIndex] || slides[0];
+
+                      return (
+                        <div className="w-full flex flex-col gap-4">
+                          {/* Slide Canvas */}
+                          <div className="aspect-video w-full max-w-xl mx-auto rounded-[4px] border border-[#eef1f4] bg-[#0f172a] text-white shadow-lg p-8 flex flex-col justify-between relative select-text overflow-y-auto">
+                            <div className="border-b border-white/10 pb-2 flex justify-between items-center select-none">
+                              <span className="text-[9px] font-bold uppercase tracking-wider text-white/40">Presentation Preview</span>
+                              <span className="text-[9px] font-bold font-mono text-white/50 bg-white/10 px-2 py-0.5 rounded-full">
+                                Slide {activeSlide.index} of {slides.length}
+                              </span>
+                            </div>
+                            
+                            <div className="flex-1 flex flex-col justify-center my-4">
+                              {activeSlide.content.length > 0 ? (
+                                <div className="space-y-3">
+                                  {/* First bullet can act as a title/header if it's large */}
+                                  <h4 className="text-sm font-bold tracking-tight text-white mb-2">
+                                    {activeSlide.content[0]}
+                                  </h4>
+                                  {activeSlide.content.slice(1).map((line, lIdx) => (
+                                    <div key={lIdx} className="flex items-start gap-2 text-xs text-white/80 leading-relaxed pl-2">
+                                      <span className="text-amber-400 select-none">•</span>
+                                      <p>{line}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                              ) : (
+                                <p className="text-center text-white/30 italic">Blank Slide</p>
+                              )}
+                            </div>
+
+                            <div className="border-t border-white/5 pt-2 flex justify-between items-center text-[8px] font-bold text-white/30 select-none">
+                              <span>{previewDoc.filename}</span>
+                              <span>Insurance Agentic RAG Platform</span>
+                            </div>
+                          </div>
+
+                          {/* Presentation Controls */}
+                          <div className="flex items-center justify-center gap-4 bg-white border border-[#eef1f4] p-3 rounded-[4px] shadow-sm max-w-md mx-auto w-full select-none">
+                            <button
+                              onClick={() => setActiveSlideIndex(prev => Math.max(0, prev - 1))}
+                              disabled={activeSlideIndex === 0}
+                              className="px-3 py-1.5 rounded-[4px] border border-[#eef1f4] hover:bg-[#f7f9fb] disabled:opacity-40 disabled:hover:bg-white text-[10px] font-bold uppercase tracking-wider text-[#0f172a] cursor-pointer transition-colors"
+                            >
+                              ◀ Previous
+                            </button>
+                            <span className="text-[10px] font-bold font-mono text-[#0f172a]/60">
+                              {activeSlideIndex + 1} / {slides.length}
+                            </span>
+                            <button
+                              onClick={() => setActiveSlideIndex(prev => Math.min(slides.length - 1, prev + 1))}
+                              disabled={activeSlideIndex === slides.length - 1}
+                              className="px-3 py-1.5 rounded-[4px] border border-[#eef1f4] hover:bg-[#f7f9fb] disabled:opacity-40 disabled:hover:bg-white text-[10px] font-bold uppercase tracking-wider text-[#0f172a] cursor-pointer transition-colors"
+                            >
+                              Next ▶
+                            </button>
+                          </div>
+
+                          {/* Slide Thumbnails Selector */}
+                          <div className="flex gap-2 justify-center overflow-x-auto py-1 max-w-lg mx-auto w-full select-none">
+                            {slides.map((slide, idx) => (
+                              <button
+                                key={idx}
+                                onClick={() => setActiveSlideIndex(idx)}
+                                className={`w-8 h-6 rounded-[2px] border text-[8px] font-mono font-bold flex items-center justify-center transition-all cursor-pointer ${
+                                  activeSlideIndex === idx
+                                    ? "bg-[#0f172a] text-white border-[#0f172a] scale-110 shadow-sm"
+                                    : "bg-white text-[#0f172a]/50 border-[#eef1f4] hover:border-[#0f172a]/30"
+                                }`}
+                              >
+                                {slide.index}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // 5. Word Document Preview (DOCX, DOC)
+                    if (fileExt === "docx") {
+                      return (
+                        <div className="w-full flex flex-col gap-2">
+                          <div
+                            ref={docxContainerRef}
+                            className="w-full bg-white border border-[#eef1f4] rounded-[4px] shadow-sm max-h-[65vh] overflow-y-auto p-4 select-text"
+                          />
+                        </div>
+                      );
+                    }
+
+                    if (fileExt === "doc") {
+                      return (
+                        <div className="max-w-2xl mx-auto bg-white border border-[#eef1f4] rounded-[4px] shadow-sm p-8 select-text font-serif leading-relaxed text-[#0f172a]/95 text-xs max-h-[60vh] overflow-y-auto">
+                          <div className="prose prose-sm max-w-none">
+                            {previewDoc.extracted_text ? (
+                              previewDoc.extracted_text.split("\n").map((para, pIdx) => {
+                                const trimmed = para.trim();
+                                if (!trimmed) return <div key={pIdx} className="h-3" />;
+                                
+                                // Check if paragraph is table row data (separated by ' | ')
+                                if (trimmed.includes(" | ")) {
+                                  const cells = trimmed.split(" | ");
+                                  return (
+                                    <div key={pIdx} className="my-2 border border-slate-200 rounded-[2px] bg-slate-50 p-2 font-sans text-[11px] overflow-x-auto">
+                                      <table className="w-full border-collapse">
+                                        <tbody>
+                                          <tr>
+                                            {cells.map((cell, cIdx) => (
+                                              <td key={cIdx} className="border-r border-slate-200 last:border-0 px-2 py-1 select-text">
+                                                {cell}
+                                              </td>
+                                            ))}
+                                          </tr>
+                                        </tbody>
+                                      </table>
+                                    </div>
+                                  );
+                                }
+
+                                // Otherwise render standard paragraph
+                                return (
+                                  <p key={pIdx} className="mb-3 text-[12px] leading-relaxed text-justify">
+                                    {trimmed}
+                                  </p>
+                                );
+                              })
+                            ) : (
+                              <p className="text-center italic text-slate-400 font-sans">[No content found in this document]</p>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    }
+
+                    // 6. Source Code formats (JSON, YAML, YML, MD, TXT)
+                    if (["json", "yaml", "yml", "md", "txt"].includes(fileExt)) {
+                      return (
+                        <div className="w-full flex flex-col gap-2">
+                          {/* Copy to Clipboard and utility bar */}
+                          <div className="flex justify-between items-center bg-white border border-[#eef1f4] px-4 py-2 rounded-[4px] shadow-sm select-none">
+                            <span className="text-[9px] font-bold text-[#0f172a]/50 uppercase tracking-widest font-mono">
+                              {fileExt} Format Source
+                            </span>
+                            <button
+                              onClick={() => handleCopyToClipboard(previewDoc.extracted_text || "")}
+                              className="px-2.5 py-1 text-[10px] font-bold uppercase tracking-wider rounded-[4px] border border-[#eef1f4] bg-[#f7f9fb] hover:bg-[#eef1f4] transition-colors cursor-pointer text-[#0f172a]/80"
+                            >
+                              {copySuccess ? "✓ Copied!" : "📋 Copy Content"}
+                            </button>
+                          </div>
+
+                          {/* Code Block Container */}
+                          <pre className="bg-white border border-[#eef1f4] rounded-[4px] p-4 font-mono text-[11px] leading-relaxed whitespace-pre-wrap select-text text-[#0f172a]/80 shadow-sm max-h-[50vh] overflow-y-auto">
+                            {previewDoc.extracted_text || "[No content extracted from this document]"}
+                          </pre>
+                        </div>
+                      );
+                    }
+
+                    // Fallback visual container
+                    return (
+                      <div className="w-full flex flex-col gap-2">
+                        <div className="bg-white border border-[#eef1f4] rounded-[4px] p-4 font-mono leading-relaxed whitespace-pre-wrap select-text text-[#0f172a]/80 shadow-sm max-h-[50vh] overflow-y-auto">
+                          {previewDoc.extracted_text || "[No content extracted from this document]"}
+                        </div>
+                      </div>
+                    );
+                  })()}
+                </div>
+
+                {/* Modal Footer */}
+                <div className="px-6 py-4 border-t border-[#eef1f4] flex justify-end">
+                  <button
+                    onClick={handleClosePreview}
+                    className="px-4 py-2 rounded-[4px] bg-[#0f172a] hover:bg-[#1e293b] text-xs font-bold text-white transition-all cursor-pointer shadow-sm"
+                  >
+                    Close Preview
+                  </button>
+                </div>
+              </div>
+            </div>
           )}
 
         </div>
